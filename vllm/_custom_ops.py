@@ -2468,6 +2468,51 @@ def reshape_and_cache_flash(
     )
 
 
+def has_fused_qk_norm_rope_kv_insert() -> bool:
+    return hasattr(torch.ops._C, "fused_qk_norm_rope_kv_insert")
+
+
+def fused_qk_norm_rope_kv_insert(
+    qkv: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    eps: float,
+    slot_mapping: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+) -> None:
+    """Per-head QK RMSNorm + NeoX RoPE over the full head + KV-cache write in
+    one kernel.
+
+    ``qkv`` is ``[num_tokens, (num_heads + 2 * num_kv_heads) * head_dim]`` and
+    is not modified. The normed (and, with ``cos_sin_cache``, roped) q and k
+    go to the contiguous ``q_out`` / ``k_out``. With ``kv_cache`` (logical
+    ``[num_blocks, 2, block_size, num_kv_heads, head_dim]``, unquantized) k and
+    v are also written to the cache at ``slot_mapping`` (negative slots and
+    rows past ``slot_mapping.numel()`` are skipped, as in
+    ``reshape_and_cache_flash``). No ``cos_sin_cache`` means norm only.
+    """
+    torch.ops._C.fused_qk_norm_rope_kv_insert(
+        qkv,
+        q_out,
+        k_out,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        num_heads,
+        num_kv_heads,
+        eps,
+        slot_mapping,
+        kv_cache,
+    )
+
+
 def fused_minimax_m3_qknorm_rope_kv_insert(
     qkv: torch.Tensor,
     q_norm_weight: torch.Tensor,

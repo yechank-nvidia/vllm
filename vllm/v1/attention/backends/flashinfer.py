@@ -2145,6 +2145,44 @@ class FlashInferImpl(AttentionImpl):
                     output[:num_decode_tokens].copy_(out.to(output.dtype))
         return output_padded
 
+    def fused_qk_norm_rope_kvcache_supported(self) -> bool:
+        # The fused kernel writes the same cache entries as
+        # reshape_and_cache_flash below, for unquantized caches.
+        return (
+            self.kv_sharing_target_layer_name is None
+            and not is_quantized_kv_cache(self.kv_cache_dtype)
+            and custom_ops.has_fused_qk_norm_rope_kv_insert()
+        )
+
+    def do_qk_norm_rope_kvcache_update(
+        self,
+        layer: torch.nn.Module,
+        qkv: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        positions: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        rms_norm_eps: float,
+        cos_sin_cache: torch.Tensor | None,
+        kv_cache: torch.Tensor | None,
+        layer_slot_mapping: torch.Tensor | None,
+    ) -> None:
+        custom_ops.fused_qk_norm_rope_kv_insert(
+            qkv,
+            q_out,
+            k_out,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            rms_norm_eps,
+            layer_slot_mapping,
+            kv_cache if layer_slot_mapping is not None else None,
+        )
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,

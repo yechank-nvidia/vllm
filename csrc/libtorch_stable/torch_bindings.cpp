@@ -468,6 +468,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "int block_size, Tensor!? q_out, Tensor!? index_q_out, "
       "str kv_cache_dtype) -> ()");
 
+  // Fused per-head QK RMSNorm + optional RoPE + KV-cache write.
+  ops.def(
+      "fused_qk_norm_rope_kv_insert("
+      "Tensor qkv, Tensor! q_out, Tensor! k_out, Tensor q_weight, "
+      "Tensor k_weight, Tensor? cos_sin_cache, Tensor positions, "
+      "int num_heads, int num_kv_heads, float eps, Tensor? slot_mapping, "
+      "Tensor!? kv_cache) -> ()");
+
   // Apply repetition penalties to logits in-place.
   ops.def(
       "apply_repetition_penalties_(Tensor! logits, Tensor prompt_mask, "
@@ -683,6 +691,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 #endif
   ops.impl("fused_minimax_m3_qknorm_rope_kv_insert",
            TORCH_BOX(&fused_minimax_m3_qknorm_rope_kv_insert));
+  ops.impl("fused_qk_norm_rope_kv_insert",
+           TORCH_BOX(&fused_qk_norm_rope_kv_insert));
 
   // Sampler kernels (shared CUDA/ROCm)
   ops.impl("apply_repetition_penalties_",

@@ -492,6 +492,10 @@ class Attention(nn.Module, AttentionLayerBase):
         # definition specify the output tensor shape.
         output_shape: torch.Size | None = None,
         output_dtype: torch.dtype | None = None,
+        # Set when the caller already wrote this step's K/V into the cache
+        # (see `qk_norm_rope_kv_cache_update`): skip the layer's own cache
+        # update and order attention after the caller's.
+        kv_cache_dummy_dep: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -536,11 +540,11 @@ class Attention(nn.Module, AttentionLayerBase):
             key = key.view(-1, self.num_kv_heads, self.head_size)
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
-        kv_cache_dummy_dep = None
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
             if (
-                not self.attn_backend.forward_includes_kv_cache_update
+                kv_cache_dummy_dep is None
+                and not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
@@ -560,7 +564,8 @@ class Attention(nn.Module, AttentionLayerBase):
             # Skip this if sharing KV cache with an earlier attention layer.
             encoded = _encode_layer_name(self.layer_name)
             if (
-                not self.attn_backend.forward_includes_kv_cache_update
+                kv_cache_dummy_dep is None
+                and not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
@@ -577,6 +582,59 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
         return output.view(-1, hidden_size)
+
+    def supports_qk_norm_rope_kv_cache_update(self) -> bool:
+        """True when `qk_norm_rope_kv_cache_update` can replace the model's
+        per-head QK-norm + RoPE and this layer's own KV-cache update."""
+        return (
+            not self.calculate_kv_scales
+            and self.query_quant is None
+            and self.kv_sharing_target_layer_name is None
+            and not self.attn_backend.forward_includes_kv_cache_update
+            and self.head_size == self.head_size_v
+            and self.impl.fused_qk_norm_rope_kvcache_supported()
+        )
+
+    def qk_norm_rope_kv_cache_update(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        rms_norm_eps: float,
+        cos_sin_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-head RMSNorm on q and k, NeoX RoPE over the full head (none
+        when `cos_sin_cache` is None) and this step's KV-cache write, as one op.
+
+        `qkv` is the packed `[q | k | v]` projection output. Returns
+        `(q, k, v, kv_cache_dummy_dep)`; pass all four to `forward` (the dummy
+        as `kv_cache_dummy_dep`) so the layer does not write the cache again.
+        """
+        num_tokens = qkv.shape[0]
+        q_size = self.num_heads * self.head_size
+        kv_size = self.num_kv_heads * self.head_size
+        q = torch.empty((num_tokens, q_size), dtype=qkv.dtype, device=qkv.device)
+        k = torch.empty((num_tokens, kv_size), dtype=qkv.dtype, device=qkv.device)
+        if self.use_direct_call:
+            op = fused_qk_norm_rope_and_unified_kv_cache_update
+            layer_name = self.layer_name
+        else:
+            op = torch.ops.vllm.fused_qk_norm_rope_and_unified_kv_cache_update
+            layer_name = _encode_layer_name(self.layer_name)
+        dep = op(
+            q,
+            k,
+            qkv,
+            positions,
+            q_weight,
+            k_weight,
+            rms_norm_eps,
+            cos_sin_cache,
+            layer_name,
+        )
+        v = qkv[:, q_size + kv_size : q_size + 2 * kv_size]
+        return q, k, v, dep
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
@@ -805,6 +863,61 @@ direct_register_custom_op(
     op_func=unified_kv_cache_update,
     fake_impl=unified_kv_cache_update_fake,
     mutates_args=[],
+)
+
+
+def fused_qk_norm_rope_and_unified_kv_cache_update(
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor | None,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """Per-head QK-norm + RoPE into q_out / k_out and the KV-cache write of
+    `layer_name`, in one kernel. Like `unified_kv_cache_update`, it returns a
+    dummy that orders the attention op after the cache write."""
+    layer_name = _resolve_layer_name(layer_name)
+    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    # Without a slot mapping (memory profiling) only q_out / k_out are written.
+    attn_layer.impl.do_qk_norm_rope_kvcache_update(  # type: ignore[attr-defined]
+        attn_layer,
+        qkv,
+        q_out,
+        k_out,
+        positions,
+        q_weight,
+        k_weight,
+        rms_norm_eps,
+        cos_sin_cache,
+        kv_cache,
+        layer_slot_mapping,
+    )
+    return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
+
+
+def fused_qk_norm_rope_and_unified_kv_cache_update_fake(
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor | None,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+
+
+direct_register_custom_op(
+    op_name="fused_qk_norm_rope_and_unified_kv_cache_update",
+    op_func=fused_qk_norm_rope_and_unified_kv_cache_update,
+    fake_impl=fused_qk_norm_rope_and_unified_kv_cache_update_fake,
+    mutates_args=["q_out", "k_out"],
 )
 
 
