@@ -20,6 +20,7 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.kv_cache_interface import CrossAttentionSpec, MambaSpec
 from vllm.v1.request import Request
+from vllm.v1.sample.ops.topk_topp_sampler import warmup_triton_top_k_top_p
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
@@ -309,6 +310,16 @@ def warmup_kernels(
 
         worker_execute_model(decode_output)
         worker_sample_tokens(None)
+
+        if model_runner.is_last_pp_rank:
+            warmup_triton_top_k_top_p(
+                model_runner.vocab_size,
+                min(
+                    model_runner.max_num_tokens,
+                    model_runner.max_num_reqs * decode_query_len,
+                ),
+                model_runner.device,
+            )
 
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()

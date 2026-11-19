@@ -17,6 +17,8 @@ if HAS_TRITON:
 
 logger = init_logger(__name__)
 
+_TRITON_MIN_BATCH_SIZE = 8
+
 
 def flashinfer_sampler_supported() -> bool:
     """Decide whether FlashInfer's top-p/top-k sampler can be used.
@@ -353,11 +355,27 @@ def apply_top_k_top_p(
             return apply_top_k_top_p_triton(logits, k, p)
         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
 
-    if HAS_TRITON and logits.shape[0] >= 8:
+    if HAS_TRITON and logits.shape[0] >= _TRITON_MIN_BATCH_SIZE:
         return apply_top_k_top_p_triton(logits, k, p)
 
     # Use pytorch sort implementation for small batch sizes.
     return apply_top_k_top_p_pytorch(logits, k, p)
+
+
+def warmup_triton_top_k_top_p(
+    vocab_size: int, max_num_logits: int, device: torch.device
+) -> None:
+    """Compile the Triton top-k / top-p kernel (top-k, top-p, both) before
+    serving, so the first busy batch does not compile it."""
+    if not HAS_TRITON or max_num_logits < _TRITON_MIN_BATCH_SIZE:
+        return
+    batch_size = _TRITON_MIN_BATCH_SIZE
+    logits = torch.empty((batch_size, vocab_size), dtype=torch.float32, device=device)
+    # Neutral thresholds: nothing is masked.
+    k = torch.full((batch_size,), vocab_size, dtype=torch.int32, device=device)
+    p = torch.ones((batch_size,), dtype=torch.float32, device=device)
+    for k_or_none, p_or_none in ((k, None), (None, p), (k, p)):
+        apply_top_k_top_p_triton(logits, k_or_none, p_or_none)
 
 
 def apply_top_k_top_p_pytorch(
