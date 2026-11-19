@@ -31,12 +31,16 @@ static inline cute::Shape<int, int, int, int> get_problem_shape(
   return {m, n, k, 1};
 }
 
+// Launches the kernel and returns true. With workspace_optional, returns false
+// without launching when the kernel's workspace cannot be allocated, so the
+// caller can run a kernel that needs no workspace instead.
 template <typename GemmKernel>
-void cutlass_gemm_caller(
+bool cutlass_gemm_caller(
     torch::stable::Device device, cute::Shape<int, int, int, int> prob_shape,
     typename GemmKernel::MainloopArguments mainloop_args,
     typename GemmKernel::EpilogueArguments epilogue_args,
-    typename GemmKernel::TileSchedulerArguments scheduler = {}) {
+    typename GemmKernel::TileSchedulerArguments scheduler = {},
+    bool workspace_optional = false) {
   const torch::stable::accelerator::DeviceGuard device_guard(device.index());
   cutlass::KernelHardwareInfo hw_info;
   typename GemmKernel::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
@@ -52,14 +56,23 @@ void cutlass_gemm_caller(
   CUTLASS_CHECK(gemm_op.can_implement(args));
 
   size_t workspace_size = gemm_op.get_workspace_size(args);
-  auto workspace =
-      torch::stable::empty(workspace_size, torch::headeronly::ScalarType::Byte,
-                           std::nullopt, device);
+  std::optional<torch::stable::Tensor> workspace;
+  try {
+    workspace = torch::stable::empty(workspace_size,
+                                     torch::headeronly::ScalarType::Byte,
+                                     std::nullopt, device);
+  } catch (std::exception const&) {
+    if (!workspace_optional) {
+      throw;
+    }
+    return false;
+  }
 
   auto stream = get_current_cuda_stream(device.index());
 
-  cutlass::Status status = gemm_op.run(args, workspace.data_ptr(), stream);
+  cutlass::Status status = gemm_op.run(args, workspace->data_ptr(), stream);
   CUTLASS_CHECK(status);
+  return true;
 }
 
 template <typename Gemm, typename... EpilogueArgs>
