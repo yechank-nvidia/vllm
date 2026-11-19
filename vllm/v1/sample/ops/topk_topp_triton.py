@@ -932,11 +932,14 @@ def apply_top_k_top_p_triton(
     # On XPU, large BLOCK_SIZE causes precision loss in the single-pass pivot
     # approximation; use smaller tiles for accurate top-p results.
     if logits.device.type == "cpu":
-        block_size, block_size_trunc = 256, 128
+        block_size, block_size_trunc, num_warps = 256, 128, 4
     elif logits.device.type == "xpu":
-        block_size, block_size_trunc = 4096, 2048
+        block_size, block_size_trunc, num_warps = 4096, 2048, 4
     else:
-        block_size, block_size_trunc = 8192, 4096
+        block_size, block_size_trunc, num_warps = 8192, 4096, 8
+        # Each program serially sweeps the vocab row in BLOCK_SIZE tiles, so
+        # per-tile latency bounds kernel latency; 8 warps beat Triton's
+        # default of 4 here.
 
     _topk_topp_kernel[(NUM_PROGRAMS,)](
         logits,
@@ -953,6 +956,7 @@ def apply_top_k_top_p_triton(
         BLOCK_SIZE_TRUNC=block_size_trunc,
         TOPK_ENABLED=topk_enabled,
         TOPP_ENABLED=topp_enabled,
+        num_warps=num_warps,
     )
 
     return logits
