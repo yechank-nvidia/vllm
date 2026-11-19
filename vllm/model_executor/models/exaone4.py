@@ -208,6 +208,7 @@ class Exaone4Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        output_token_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         if self.fuse_qk_norm_rope_kv:
@@ -235,6 +236,8 @@ class Exaone4Attention(nn.Module):
             if self.use_rope:
                 q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache_dummy_dep=kv_cache_dummy_dep)
+        if output_token_indices is not None:
+            attn_output = attn_output.index_select(0, output_token_indices)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -288,6 +291,7 @@ class Exaone4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        output_token_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
 
@@ -295,7 +299,10 @@ class Exaone4DecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            output_token_indices=output_token_indices,
         )
+        if output_token_indices is not None:
+            residual = residual.index_select(0, output_token_indices)
 
         # Use post-LN
         hidden_states = self.post_attention_layernorm(hidden_states)
