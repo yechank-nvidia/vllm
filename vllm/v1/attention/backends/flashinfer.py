@@ -3,6 +3,7 @@
 """Attention layer with FlashInfer."""
 
 import copy
+import importlib
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import cached_property, partial
@@ -35,6 +36,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
+)
+from vllm.model_executor.warmup.cutedsl_warmup import (
+    CuTeDSLCompileUnit,
+    register_cutedsl_warmup_provider,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -1571,6 +1576,36 @@ class FlashInferImpl(AttentionImpl):
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
 
+        # FA4 paged prefill beat trtllm-gen on SM100 for this BF16, page-16
+        # shape (EXAONE 4.5: 40 q / 8 kv heads of 128, window 4096). Other
+        # shapes were not measured, so they keep trtllm-gen.
+        self._fa4_prefill = None
+        if (
+            (num_heads, num_kv_heads, head_size) == (40, 8, 128)
+            and sliding_window in (None, 4096)
+            and vllm_config is not None
+            and vllm_config.attention_config.use_trtllm_attention is None
+            and self.supports_xqa_or_trtllm_gen_decode
+            and not is_quantized_kv_cache(kv_cache_dtype)
+            and self.total_cp_world_size == 1
+            and self.alibi_slopes is None
+            and self.sinks is None
+            and not self.logits_soft_cap
+            and current_platform.is_device_capability(100)
+        ):
+            try:
+                from vllm.vllm_flash_attn import (
+                    flash_attn_varlen_func,
+                    is_fa_version_supported,
+                )
+
+                if is_fa_version_supported(4):
+                    importlib.import_module("vllm.vllm_flash_attn.cute.interface")
+                    self._fa4_prefill = flash_attn_varlen_func
+                    register_cutedsl_warmup_provider(self)
+            except (ImportError, OSError):
+                pass
+
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.is_kvcache_nvfp4 and vllm_config is not None:
             max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -1591,6 +1626,68 @@ class FlashInferImpl(AttentionImpl):
             self.dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
         else:
             self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
+
+    def _run_fa4_prefill(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        max_q_len: int,
+        cu_seqlens_q: torch.Tensor,
+        max_seq_len: int,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        assert self._fa4_prefill is not None
+        k_cache, v_cache = kv_cache.unbind(dim=1)
+        self._fa4_prefill(
+            query,
+            k_cache.transpose(1, 2),
+            v_cache.transpose(1, 2),
+            max_seqlen_q=max_q_len,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seq_len,
+            seqused_k=seq_lens,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=self.sliding_window,
+            block_table=block_table,
+            out=out,
+            # One KV split: the split-KV kernels would compile at first use.
+            num_splits=1,
+            fa_version=4,
+        )
+
+    def get_cutedsl_warmup_compile_units(self) -> tuple[CuTeDSLCompileUnit, ...]:
+        """Compile the FA4 prefill kernels before serving."""
+        if self._fa4_prefill is None:
+            return ()
+        # FA4 builds one kernel per window and per q_stage (one or two 128-row
+        # Q tiles after GQA packing); a 1-token and a 129-token query cover both.
+        return tuple(
+            CuTeDSLCompileUnit(
+                name="fa4_flashinfer_prefill",
+                key=("fa4_flashinfer_prefill", self.sliding_window, q_len, kv_len),
+                compile=partial(self._warm_up_fa4_prefill, q_len, kv_len),
+            )
+            for q_len, kv_len in ((1, 1), (129, 129))
+        )
+
+    def _warm_up_fa4_prefill(self, q_len: int, kv_len: int) -> None:
+        # One request whose pages (16 tokens, as the route requires) all point
+        # at one zero page.
+        kv_shape = (1, 2, self.num_kv_heads, 16, self.head_size)
+        kv_cache = torch.zeros(kv_shape, dtype=torch.bfloat16, device="cuda")
+        q_shape = (q_len, self.num_heads, self.head_size)
+        query = torch.zeros(q_shape, dtype=torch.bfloat16, device="cuda")
+        lens = torch.tensor([0, q_len, kv_len], dtype=torch.int32, device="cuda")
+        block_table = torch.zeros(
+            (1, cdiv(kv_len, 16)), dtype=torch.int32, device="cuda"
+        )
+        out = torch.empty_like(query)
+        self._run_fa4_prefill(
+            query, kv_cache, q_len, lens[:2], kv_len, lens[2:], block_table, out
+        )
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         # XQA does not support FP8/NVFP4 output, so require trtllm-gen
@@ -1875,6 +1972,26 @@ class FlashInferImpl(AttentionImpl):
                         output[
                             num_decode_tokens : num_decode_tokens + num_prefill_tokens
                         ].copy_(out_prefill.to(output.dtype))
+            elif (
+                self._fa4_prefill is not None
+                and prefill_query.dtype == kv_cache_permute.dtype == torch.bfloat16
+                and output.dtype == torch.bfloat16
+                and output_scale is None
+                and kv_cache_permute.shape[-2] == 16
+                and get_kv_cache_layout() == "HND"
+            ):
+                prefill = attn_metadata.prefill
+                assert isinstance(prefill, TRTLLMPrefill)
+                self._run_fa4_prefill(
+                    prefill_query,
+                    kv_cache_permute,
+                    prefill.max_q_len,
+                    prefill.cum_seq_lens_q,
+                    prefill.max_seq_len,
+                    prefill.seq_lens,
+                    prefill.block_tables,
+                    output[num_decode_tokens:],
+                )
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
                 # prefill_query may be non-contiguous or have degenerate strides
