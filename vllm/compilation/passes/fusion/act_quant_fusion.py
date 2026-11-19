@@ -14,6 +14,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic64Sym,
     kFp8Dynamic128Sym,
+    kFp8DynamicTokenSym,
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
 )
@@ -42,6 +43,12 @@ if silu_and_mul_nvfp4_quant_supported:
 if current_platform.is_cuda_alike():
     FUSED_OPS[kFp8Dynamic128Sym] = torch.ops._C.silu_and_mul_per_block_quant.default
     FUSED_OPS[kFp8Dynamic64Sym] = torch.ops._C.silu_and_mul_per_block_quant.default
+
+if current_platform.is_cuda():
+    # Triton op, registered when fp8_utils is imported.
+    import vllm.model_executor.layers.quantization.utils.fp8_utils  # noqa: F401
+
+    FUSED_OPS[kFp8DynamicTokenSym] = torch.ops.vllm.silu_and_mul_per_token_quant.default
 
 
 class ActivationQuantPattern(VllmPatternReplacement):
@@ -121,6 +128,37 @@ class SiluMulFp8StaticQuantPattern(ActivationQuantPattern):
                 self.FUSED_OP, result=result, input=input, scale=scale
             )
             return at[1]
+
+        return _replacement
+
+
+class SiluMulPerTokenQuantPattern(ActivationQuantPattern):
+    """Fuse native SiLU-mul with dynamic per-token FP8 quantization."""
+
+    def __init__(self) -> None:
+        super().__init__(kFp8DynamicTokenSym)
+        # The custom ops round SiLU to the input dtype and skip NaNs in the
+        # amax; the fused op does neither, so their graphs are left alone.
+        self.silu_and_mul_matcher = MatcherSiluAndMul(enabled=False)
+        self.quant_matcher = MatcherQuantFP8(kFp8DynamicTokenSym, enabled=False)
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        return self.silu_and_mul_matcher.inputs()
+
+    @property
+    def pattern(self):
+        def _pattern(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            result_silu_mul = self.silu_and_mul_matcher(input)
+            result, scale = self.quant_matcher(result_silu_mul)
+            return result, scale
+
+        return _pattern
+
+    @property
+    def replacement(self):
+        def _replacement(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            result, scale = self.FUSED_OP(input)
+            return result, scale
 
         return _replacement
 
@@ -294,6 +332,9 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
         super().__init__(config, "activation_quant_fusion_pass")
 
         self.register(SiluMulFp8StaticQuantPattern())
+
+        if kFp8DynamicTokenSym in FUSED_OPS:
+            self.register(SiluMulPerTokenQuantPattern())
 
         if silu_and_mul_nvfp4_quant_supported:
             self.register(SiluMulNvfp4QuantPattern())

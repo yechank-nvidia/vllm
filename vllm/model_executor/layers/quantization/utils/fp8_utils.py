@@ -500,6 +500,173 @@ def silu_mul_per_token_group_quant_fp8_colmajor(
 
 
 @triton.jit
+def _max_propagate_nan(a, b):
+    # max.NaN: what Inductor emits for torch max/clamp (NaN wins).
+    return tl.maximum(a, b, tl.PropagateNan.ALL)
+
+
+@triton.jit
+def _silu_mul_fp32(gate, up):
+    # fp32 SiLU and product, not rounded to the input dtype in between. This is
+    # how Inductor computes the native SiluAndMul when it fuses it into a quant.
+    gate = gate.to(tl.float32)
+    return gate / (tl.extra.cuda.libdevice.exp(-gate) + 1.0) * up.to(tl.float32)
+
+
+@triton.jit
+def _per_token_fp8_scale(amax, FP8_MAX: tl.constexpr, MIN_SCALE: tl.constexpr):
+    # Native per-token QuantFP8 under Inductor: amax / FP8_MAX is folded into
+    # amax * (1 / FP8_MAX), then clamped from below.
+    return _max_propagate_nan(amax * (1.0 / FP8_MAX), MIN_SCALE)
+
+
+@triton.jit
+def _silu_and_mul_per_token_quant_kernel(
+    x_ptr,  # [M, 2 * D]
+    q_ptr,  # [M, D]
+    s_ptr,  # [M]
+    D,
+    stride_x,
+    stride_q,
+    FP8_MAX: tl.constexpr,
+    MIN_SCALE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ONE_PASS: tl.constexpr,
+    STATIC_D: tl.constexpr = None,
+):
+    """One program per row: q, s = per_token_fp8_quant(silu(x[:D]) * x[D:]).
+
+    The FP8 cast rounds finite y / s at the scale bound to FP8_MAX in
+    magnitude. The row reduction and cast also preserve NaN propagation.
+    """
+    if STATIC_D is not None:
+        D = STATIC_D
+    row = tl.program_id(0).to(tl.int64)
+    x_row = x_ptr + row * stride_x
+    q_row = q_ptr + row * stride_q
+    cols = tl.arange(0, BLOCK)
+    if ONE_PASS:
+        # BLOCK >= D: the row stays in registers, so it is read once.
+        mask = cols < D
+        y = _silu_mul_fp32(
+            tl.load(x_row + cols, mask=mask, other=0.0),
+            tl.load(x_row + D + cols, mask=mask, other=0.0),
+        )
+        amax = tl.reduce(
+            tl.where(mask, tl.abs(y), float("-inf")), 0, _max_propagate_nan
+        )
+        scale = _per_token_fp8_scale(amax, FP8_MAX, MIN_SCALE)
+        tl.store(s_ptr + row, scale)
+        q = y * (1.0 / scale)
+        tl.store(q_row + cols, q.to(q_ptr.dtype.element_ty), mask=mask)
+    else:
+        # Rows too wide for registers: one pass for the amax, one to quantize.
+        acc = tl.full([BLOCK], float("-inf"), tl.float32)
+        for off in range(0, D, BLOCK):
+            c = off + cols
+            mask = c < D
+            y = _silu_mul_fp32(
+                tl.load(x_row + c, mask=mask, other=0.0),
+                tl.load(x_row + D + c, mask=mask, other=0.0),
+            )
+            acc = tl.where(mask, _max_propagate_nan(acc, tl.abs(y)), acc)
+        amax = tl.reduce(acc, 0, _max_propagate_nan)
+        scale = _per_token_fp8_scale(amax, FP8_MAX, MIN_SCALE)
+        tl.store(s_ptr + row, scale)
+        inv_scale = 1.0 / scale
+        for off in range(0, D, BLOCK):
+            c = off + cols
+            mask = c < D
+            y = _silu_mul_fp32(
+                tl.load(x_row + c, mask=mask, other=0.0),
+                tl.load(x_row + D + c, mask=mask, other=0.0),
+            )
+            q = y * inv_scale
+            tl.store(q_row + c, q.to(q_ptr.dtype.element_ty), mask=mask)
+
+
+# Widest row (next power of two of D) that the one-pass kernel keeps in registers.
+_SILU_MUL_QUANT_ONE_PASS_MAX_BLOCK = 32768
+
+
+def silu_and_mul_per_token_quant(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SiLU-and-mul followed by dynamic per-token FP8 quantization.
+
+    Evaluates SiLU, multiplication and row scaling in FP32. The one-pass
+    schedule loads the input row once and retains the product for the cast.
+    Returns (q [..., D] fp8, scale [..., 1] fp32) for input [..., 2 * D].
+    """
+    d = input.shape[-1] // 2
+    x = input.reshape(-1, input.shape[-1])
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    out = torch.empty(
+        (*input.shape[:-1], d), dtype=current_platform.fp8_dtype(), device=input.device
+    )
+    scale = torch.empty(
+        (*input.shape[:-1], 1), dtype=torch.float32, device=input.device
+    )
+    num_tokens = x.shape[0]
+    if num_tokens == 0:
+        return out, scale
+
+    _, fp8_max = get_fp8_min_max()
+    block = triton.next_power_of_2(d)
+    one_pass = block <= _SILU_MUL_QUANT_ONE_PASS_MAX_BLOCK
+    static_d = None
+    if one_pass:
+        num_warps = min(max(block // 1024, 4), 32)
+        if (
+            d == 27392
+            and num_tokens >= 1024
+            and x.dtype == torch.bfloat16
+            and current_platform.is_device_capability(100, x.device.index)
+        ):
+            # On SM100 the EXAONE BF16 row fits in two resident 8-warp CTAs
+            # per SM with a static tail mask and 16-byte vectorized loads.
+            num_warps, static_d = 8, d
+    else:
+        block, num_warps = 4096, 8
+    _silu_and_mul_per_token_quant_kernel[(num_tokens,)](
+        x,
+        out,
+        scale,
+        d,
+        x.stride(0),
+        d,
+        FP8_MAX=fp8_max,
+        MIN_SCALE=1.0 / (fp8_max * 512.0),
+        BLOCK=block,
+        ONE_PASS=one_pass,
+        STATIC_D=static_d,
+        num_warps=num_warps,
+    )
+    return out, scale
+
+
+def _silu_and_mul_per_token_quant_fake(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    d = input.shape[-1] // 2
+    out = torch.empty(
+        (*input.shape[:-1], d), dtype=current_platform.fp8_dtype(), device=input.device
+    )
+    scale = torch.empty(
+        (*input.shape[:-1], 1), dtype=torch.float32, device=input.device
+    )
+    return out, scale
+
+
+direct_register_custom_op(
+    op_name="silu_and_mul_per_token_quant",
+    op_func=silu_and_mul_per_token_quant,
+    fake_impl=_silu_and_mul_per_token_quant_fake,
+)
+
+
+@triton.jit
 def _per_token_group_quant_fp8_colmajor(
     # Pointers to inputs and output
     y_ptr,
