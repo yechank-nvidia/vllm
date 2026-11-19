@@ -56,12 +56,15 @@ class UvaBufferPool:
         size: int | Sequence[int],
         dtype: torch.dtype,
         max_concurrency: int | None = None,
+        *,
+        allow_growth: bool = False,
     ):
         if max_concurrency is None:
             max_concurrency = _DEFAULT_MAX_CONCURRENCY
         self.size = size
         self.dtype = dtype
         self.max_concurrency = max_concurrency
+        self.allow_growth = allow_growth
 
         # UVA buffers for concurrency
         self._uva_bufs = [UvaBuffer(size, dtype) for _ in range(max_concurrency)]
@@ -72,9 +75,14 @@ class UvaBufferPool:
         # Round robin to the next buffer.
         self._curr = (self._curr + 1) % self.max_concurrency
         buf = self._uva_bufs[self._curr]
+        n = len(x)
+        if self.allow_growth and n > buf.cpu.shape[0]:
+            # Like reusing the slot, growing it requires its readers to retire.
+            capacity = 1 << (n - 1).bit_length()
+            buf = UvaBuffer((capacity, *buf.cpu.shape[1:]), self.dtype)
+            self._uva_bufs[self._curr] = buf
         # CPU-to-CPU copy
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
-        n = len(x)
         dst[:n] = x
         return buf.uva[:n]
 
@@ -208,11 +216,9 @@ class StagedWriteTensor:
 
 
 class FusedStagedWriter:
-    """Applies the staged writes of several `StagedWriteTensor`s at once."""
+    """Stages writes to several GPU tensors for one fused launch."""
 
-    def __init__(
-        self, device: torch.device, max_writes: int, max_concurrency: int | None = None
-    ):
+    def __init__(self, max_writes: int, max_concurrency: int | None = None):
         new_pool = partial(
             UvaBufferPool, dtype=torch.int32, max_concurrency=max_concurrency
         )
@@ -220,55 +226,48 @@ class FusedStagedWriter:
         self.indices = new_pool(max_writes)
         self.starts = new_pool(max_writes)
         self.cu_lens = new_pool(max_writes)
-        self.device = device
+        self.contents = new_pool(1, allow_growth=True)
 
-    def apply(
-        self,
-        tensors: Sequence[StagedWriteTensor],
-        output_ptrs: torch.Tensor,
-        output_strides: torch.Tensor,
+        self._group_ids: list[int] = []
+        self._indices: list[int] = []
+        self._starts: list[int] = []
+        self._cu_lens: list[int] = []
+        self._contents: list[int] = []
+
+    def stage_write(
+        self, group_id: int, index: int, start: int, contents: list[int]
     ) -> None:
-        """Apply and clear the staged writes of `tensors` with one kernel."""
-        group_ids: list[int] = []
-        indices: list[int] = []
-        starts: list[int] = []
-        contents: list[int | float] = []
-        cu_lens: list[int] = []
+        assert index >= 0
+        assert start >= 0
+        if not contents:
+            return
+        self._group_ids.append(group_id)
+        self._indices.append(index)
+        self._starts.append(start)
+        self._contents.extend(contents)
+        self._cu_lens.append(len(self._contents))
 
-        for group_id, t in enumerate(tensors):
-            n = len(t._staged_write_indices)
-            if n == 0:
-                continue
-
-            group_ids.extend([group_id] * n)
-            indices.extend(t._staged_write_indices)
-            starts.extend(t._staged_write_starts)
-            content_base = len(contents)
-            contents.extend(t._staged_write_contents)
-            cu_lens.extend(content_base + cu_len for cu_len in t._staged_write_cu_lens)
-
-        if not group_ids:
+    def apply(self, output_ptrs: torch.Tensor, output_strides: torch.Tensor) -> None:
+        n = len(self._group_ids)
+        if not n:
             return
 
-        group_ids_uva = self.group_ids.copy_to_uva(group_ids)
-        indices_uva = self.indices.copy_to_uva(indices)
-        starts_uva = self.starts.copy_to_uva(starts)
-        cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
-        contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)
-
-        _apply_write_kernel[(len(group_ids),)](
+        _apply_write_kernel[(n,)](
             output_ptrs,
             output_strides,
-            indices_uva,
-            starts_uva,
-            contents_gpu,
-            cu_lens_uva,
-            group_ids_uva,
+            self.indices.copy_to_uva(self._indices),
+            self.starts.copy_to_uva(self._starts),
+            self.contents.copy_to_uva(self._contents),
+            self.cu_lens.copy_to_uva(self._cu_lens),
+            self.group_ids.copy_to_uva(self._group_ids),
             BLOCK_SIZE=1024,
             MULTI_GROUP=True,
         )
-        for t in tensors:
-            t.clear_staged_writes()
+        self._group_ids.clear()
+        self._indices.clear()
+        self._starts.clear()
+        self._cu_lens.clear()
+        self._contents.clear()
 
 
 @triton.jit
