@@ -516,6 +516,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
 
+#ifdef VLLM_ENABLE_SILU_FP8_SM100
+  ops.def(
+      "silu_mul_per_token_quant_sm100("
+      "Tensor input, Tensor! out, Tensor! scales, bool staged) -> ()");
+#endif
+
   // Activation function used in GeGLU with `none` approximation.
   ops.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
 
@@ -693,6 +699,10 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
            TORCH_BOX(&persistent_masked_m_silu_mul_quant));
   ops.impl("weak_ref_tensor", TORCH_BOX(&weak_ref_tensor));
   ops.impl("silu_and_mul_quant", TORCH_BOX(&silu_and_mul_quant));
+#ifdef VLLM_ENABLE_SILU_FP8_SM100
+  ops.impl("silu_mul_per_token_quant_sm100",
+           TORCH_BOX(&silu_mul_per_token_quant_sm100));
+#endif
   ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));
   ops.impl("mul_and_silu", TORCH_BOX(&mul_and_silu));
   ops.impl("gelu_and_mul", TORCH_BOX(&gelu_and_mul));

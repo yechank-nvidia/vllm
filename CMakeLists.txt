@@ -544,6 +544,21 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
         CUDA_ARCHS "${COOPERATIVE_TOPK_ARCHS}")
     endif()
 
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+      if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+        cuda_archs_loose_intersection(SILU_FP8_SM100_ARCHS "10.0f" "${CUDA_ARCHS}")
+      else()
+        cuda_archs_loose_intersection(SILU_FP8_SM100_ARCHS "10.0a" "${CUDA_ARCHS}")
+      endif()
+      if(SILU_FP8_SM100_ARCHS)
+        set(SILU_FP8_SM100_SRC
+          "csrc/libtorch_stable/quantization/fused_kernels/silu_mul_per_token_quant_sm100.cu")
+        set_gencode_flags_for_srcs(
+          SRCS "${SILU_FP8_SM100_SRC}" CUDA_ARCHS "${SILU_FP8_SM100_ARCHS}")
+        list(APPEND VLLM_STABLE_EXT_SRC "${SILU_FP8_SM100_SRC}")
+      endif()
+    endif()
+
     # Only build Marlin kernels if we are building for at least some compatible archs.
     # Keep building Marlin for 9.0 as there are some group sizes and shapes that
     # are not supported by Machete yet.
@@ -1099,6 +1114,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     if(COOPERATIVE_TOPK_ARCHS)
       target_compile_definitions(_C_stable_libtorch PRIVATE
         VLLM_ENABLE_COOPERATIVE_TOPK=1)
+    endif()
+    if(SILU_FP8_SM100_ARCHS)
+      target_compile_definitions(_C_stable_libtorch PRIVATE
+        VLLM_ENABLE_SILU_FP8_SM100=1)
     endif()
     # Needed by CUTLASS kernels
     target_compile_definitions(_C_stable_libtorch PRIVATE

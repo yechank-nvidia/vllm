@@ -346,6 +346,12 @@ void cooperative_topk(const torch::stable::Tensor& logits,
                       int64_t max_seq_len);
 #endif
 
+#ifdef VLLM_ENABLE_SILU_FP8_SM100
+void silu_mul_per_token_quant_sm100(const torch::stable::Tensor& input,
+                                    torch::stable::Tensor& out,
+                                    torch::stable::Tensor& scales, bool staged);
+#endif
+
 void selective_scan_fwd(
     const torch::stable::Tensor& u, const torch::stable::Tensor& delta,
     const torch::stable::Tensor& A, const torch::stable::Tensor& B,

@@ -19,6 +19,12 @@ logger = init_logger(__name__)
 
 current_platform.import_kernels()
 
+# One-pass SiLU-mul + dynamic per-token FP8 quant for SM100 (CUDA >= 12.8 builds
+# with SM100 in the target archs); None when this build does not have it.
+silu_mul_per_token_quant_sm100 = getattr(
+    torch.ops._C, "silu_mul_per_token_quant_sm100", None
+)
+
 if TYPE_CHECKING:
 
     def register_fake(fn):

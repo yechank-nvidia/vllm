@@ -620,13 +620,29 @@ def silu_and_mul_per_token_quant(
         num_warps = min(max(block // 1024, 4), 32)
         if (
             d == 27392
-            and num_tokens >= 1024
             and x.dtype == torch.bfloat16
             and current_platform.is_device_capability(100, x.device.index)
         ):
-            # On SM100 the EXAONE BF16 row fits in two resident 8-warp CTAs
-            # per SM with a static tail mask and 16-byte vectorized loads.
-            num_warps, static_d = 8, d
+            # Last wave of the default one-CTA-per-SM launch (0-based).
+            wave = (num_tokens - 1) // current_platform.num_compute_units(
+                x.device.index
+            )
+            native = ops.silu_mul_per_token_quant_sm100
+            if (
+                native is not None
+                and (wave >= 2 or num_tokens >= 1024)
+                and x.is_contiguous()
+                and x.data_ptr() % 16 == 0
+            ):
+                # Native kernel: the row stays in shared memory (staged in
+                # tiles below 4096 rows), two CTAs per SM.
+                native(x, out, scale, num_tokens < 4096)
+                return out, scale
+            if num_tokens >= 1024 or wave in (1, 3):
+                # The row fits in two resident 8-warp CTAs per SM with a
+                # static tail mask and 16-byte vectorized loads, which cuts
+                # the second and fourth 32-warp waves.
+                num_warps, static_d = 8, d
     else:
         block, num_warps = 4096, 8
     _silu_and_mul_per_token_quant_kernel[(num_tokens,)](
