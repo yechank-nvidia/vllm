@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
 from enum import Enum
-from functools import partial
+from functools import cached_property, partial
 from typing import ClassVar
 
 import numpy as np
@@ -798,6 +799,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_indices = self._make_buffer(max_num_pages)
         self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
 
+        # With the TRTLLM API (trtllm-gen / XQA) for both prefill and decode,
+        # the metadata reads the block table directly, so another KV cache
+        # group of the same spec only swaps its block table and slot mapping
+        # (update_block_table). FlashInfer-native wrappers are planned with
+        # page indices from the block table. Subclasses change build().
+        self.supports_update_block_table = type(
+            self
+        ) is FlashInferMetadataBuilder and all(self._causal_trtllm_dispatch)
+
     # Keep SM90 prefill/decode Q dtype selection in one place.
     def get_q_data_type(self, is_prefill: bool) -> torch.dtype:
         # The user sets --attention-config.disable_flashinfer_q_quantization
@@ -1054,6 +1064,34 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         return paged_kv_indices
 
+    @cached_property
+    def _causal_trtllm_dispatch(self) -> tuple[bool, bool]:
+        """Whether causal prefill and decode use the TRTLLM API. It depends on
+        the configuration only, not on the batch."""
+        # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
+        prefill_force_trtllm = (
+            True
+            if self.page_size >= 128
+            else self.attention_config.use_trtllm_attention
+        )
+        prefill_use_trtllm = use_trtllm_attention(
+            self.num_qo_heads,
+            self.num_kv_heads,
+            0,  # prefill selection does not use the batch sizes
+            0,
+            self.dcp_world_size,
+            self.cache_dtype,
+            self.q_data_type_prefill,
+            is_prefill=True,
+            force_use_trtllm=prefill_force_trtllm,
+            has_sinks=self.has_sinks,
+            has_spec=self.reorder_batch_threshold > 1,
+        )
+        decode_use_trtllm = (
+            self.use_trtllm_decode_attention and self.dcp_world_size <= 1
+        )
+        return prefill_use_trtllm, decode_use_trtllm
+
     def build(
         self,
         common_prefix_len: int,
@@ -1091,26 +1129,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Prefill (FI native or TRTLLM)
         # - Decode (FI native, XQA, or trtllm-gen)
         use_cascade = common_prefix_len > 0
-        uses_spec_reorder = self.reorder_batch_threshold > 1
-        # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
-        prefill_force_trtllm = (
-            True if page_size >= 128 else self.attention_config.use_trtllm_attention
-        )
-        prefill_use_trtllm = causal and use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type_prefill,
-            is_prefill=True,
-            force_use_trtllm=prefill_force_trtllm,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
-        )
-        decode_with_flashinfer_trtllm_api = (
-            causal and self.use_trtllm_decode_attention and self.dcp_world_size <= 1
+        prefill_use_trtllm, decode_with_flashinfer_trtllm_api = (
+            self._causal_trtllm_dispatch if causal else (False, False)
         )
 
         if not causal and self.use_dcp:
@@ -1443,6 +1463,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
+
+    def update_block_table(
+        self,
+        metadata: FlashInferMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> FlashInferMetadata:
+        # Only TRTLLM API metadata (see supports_update_block_table).
+        num_decodes = metadata.num_decodes
+        new_metadata = copy.copy(metadata)
+        new_metadata.slot_mapping = slot_mapping
+        if metadata.prefill is not None:
+            assert isinstance(metadata.prefill, TRTLLMPrefill)
+            new_metadata.prefill = replace(
+                metadata.prefill, block_tables=blk_table[num_decodes:]
+            )
+        if metadata.decode is not None:
+            assert isinstance(metadata.decode, FlashInferTrtllmAPIDecode)
+            new_metadata.decode = replace(
+                metadata.decode, block_tables=blk_table[:num_decodes]
+            )
+        return new_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         if self.kv_cache_spec.dtype != self.vllm_config.model_config.dtype:
