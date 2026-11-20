@@ -41,7 +41,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -190,24 +190,54 @@ class Exaone4Attention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+        # Per-head QK-norm, RoPE (sliding layers, or all layers in full
+        # attention models) and the KV-cache write as one op when the
+        # attention backend supports it; same math as the unfused path.
+        self.use_rope = bool(self.sliding_window) or self.apply_rope_all_layers
+        self.fuse_qk_norm_rope_kv = (
+            type(self.rotary_emb).forward_native is RotaryEmbedding.forward_native
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == self.rotary_emb.head_size == self.head_dim
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+            and self.q_norm.variance_size_override is None
+            and self.k_norm.variance_size_override is None
+            and self.attn.supports_qk_norm_rope_kv_cache_update()
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        output_token_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.fuse_qk_norm_rope_kv:
+            q, k, v, kv_cache_dummy_dep = self.attn.qk_norm_rope_kv_cache_update(
+                qkv,
+                positions,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_norm.variance_epsilon,
+                self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+                if self.use_rope
+                else None,
+            )
+        else:
+            kv_cache_dummy_dep = None
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        q = self.q_norm(q)
-        q = q.flatten(-2, -1)
-        k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-        k = self.k_norm(k)
-        k = k.flatten(-2, -1)
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+            q = self.q_norm(q)
+            q = q.flatten(-2, -1)
+            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            k = self.k_norm(k)
+            k = k.flatten(-2, -1)
 
-        if self.sliding_window or self.apply_rope_all_layers:
-            q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+            if self.use_rope:
+                q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, kv_cache_dummy_dep=kv_cache_dummy_dep)
+        if output_token_indices is not None:
+            attn_output = attn_output.index_select(0, output_token_indices)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -261,6 +291,7 @@ class Exaone4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        output_token_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
 
@@ -268,7 +299,10 @@ class Exaone4DecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            output_token_indices=output_token_indices,
         )
+        if output_token_indices is not None:
+            residual = residual.index_select(0, output_token_indices)
 
         # Use post-LN
         hidden_states = self.post_attention_layernorm(hidden_states)

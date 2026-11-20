@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
-from dataclasses import dataclass
+import copy
+import importlib
+from dataclasses import dataclass, replace
 from enum import Enum
-from functools import partial
+from functools import cached_property, partial
 from typing import ClassVar
 
 import numpy as np
@@ -34,6 +36,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
+)
+from vllm.model_executor.warmup.cutedsl_warmup import (
+    CuTeDSLCompileUnit,
+    register_cutedsl_warmup_provider,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -798,6 +804,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_indices = self._make_buffer(max_num_pages)
         self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
 
+        # With the TRTLLM API (trtllm-gen / XQA) for both prefill and decode,
+        # the metadata reads the block table directly, so another KV cache
+        # group of the same spec only swaps its block table and slot mapping
+        # (update_block_table). FlashInfer-native wrappers are planned with
+        # page indices from the block table. Subclasses change build().
+        self.supports_update_block_table = type(
+            self
+        ) is FlashInferMetadataBuilder and all(self._causal_trtllm_dispatch)
+
     # Keep SM90 prefill/decode Q dtype selection in one place.
     def get_q_data_type(self, is_prefill: bool) -> torch.dtype:
         # The user sets --attention-config.disable_flashinfer_q_quantization
@@ -1054,6 +1069,34 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         return paged_kv_indices
 
+    @cached_property
+    def _causal_trtllm_dispatch(self) -> tuple[bool, bool]:
+        """Whether causal prefill and decode use the TRTLLM API. It depends on
+        the configuration only, not on the batch."""
+        # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
+        prefill_force_trtllm = (
+            True
+            if self.page_size >= 128
+            else self.attention_config.use_trtllm_attention
+        )
+        prefill_use_trtllm = use_trtllm_attention(
+            self.num_qo_heads,
+            self.num_kv_heads,
+            0,  # prefill selection does not use the batch sizes
+            0,
+            self.dcp_world_size,
+            self.cache_dtype,
+            self.q_data_type_prefill,
+            is_prefill=True,
+            force_use_trtllm=prefill_force_trtllm,
+            has_sinks=self.has_sinks,
+            has_spec=self.reorder_batch_threshold > 1,
+        )
+        decode_use_trtllm = (
+            self.use_trtllm_decode_attention and self.dcp_world_size <= 1
+        )
+        return prefill_use_trtllm, decode_use_trtllm
+
     def build(
         self,
         common_prefix_len: int,
@@ -1091,26 +1134,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Prefill (FI native or TRTLLM)
         # - Decode (FI native, XQA, or trtllm-gen)
         use_cascade = common_prefix_len > 0
-        uses_spec_reorder = self.reorder_batch_threshold > 1
-        # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
-        prefill_force_trtllm = (
-            True if page_size >= 128 else self.attention_config.use_trtllm_attention
-        )
-        prefill_use_trtllm = causal and use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type_prefill,
-            is_prefill=True,
-            force_use_trtllm=prefill_force_trtllm,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
-        )
-        decode_with_flashinfer_trtllm_api = (
-            causal and self.use_trtllm_decode_attention and self.dcp_world_size <= 1
+        prefill_use_trtllm, decode_with_flashinfer_trtllm_api = (
+            self._causal_trtllm_dispatch if causal else (False, False)
         )
 
         if not causal and self.use_dcp:
@@ -1444,6 +1469,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
 
+    def update_block_table(
+        self,
+        metadata: FlashInferMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> FlashInferMetadata:
+        # Only TRTLLM API metadata (see supports_update_block_table).
+        num_decodes = metadata.num_decodes
+        new_metadata = copy.copy(metadata)
+        new_metadata.slot_mapping = slot_mapping
+        if metadata.prefill is not None:
+            assert isinstance(metadata.prefill, TRTLLMPrefill)
+            new_metadata.prefill = replace(
+                metadata.prefill, block_tables=blk_table[num_decodes:]
+            )
+        if metadata.decode is not None:
+            assert isinstance(metadata.decode, FlashInferTrtllmAPIDecode)
+            new_metadata.decode = replace(
+                metadata.decode, block_tables=blk_table[:num_decodes]
+            )
+        return new_metadata
+
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         if self.kv_cache_spec.dtype != self.vllm_config.model_config.dtype:
             # TODO: The cascade wrapper currently does not support setting
@@ -1529,6 +1576,36 @@ class FlashInferImpl(AttentionImpl):
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
 
+        # FA4 paged prefill beat trtllm-gen on SM100 for this BF16, page-16
+        # shape (EXAONE 4.5: 40 q / 8 kv heads of 128, window 4096). Other
+        # shapes were not measured, so they keep trtllm-gen.
+        self._fa4_prefill = None
+        if (
+            (num_heads, num_kv_heads, head_size) == (40, 8, 128)
+            and sliding_window in (None, 4096)
+            and vllm_config is not None
+            and vllm_config.attention_config.use_trtllm_attention is None
+            and self.supports_xqa_or_trtllm_gen_decode
+            and not is_quantized_kv_cache(kv_cache_dtype)
+            and self.total_cp_world_size == 1
+            and self.alibi_slopes is None
+            and self.sinks is None
+            and not self.logits_soft_cap
+            and current_platform.is_device_capability(100)
+        ):
+            try:
+                from vllm.vllm_flash_attn import (
+                    flash_attn_varlen_func,
+                    is_fa_version_supported,
+                )
+
+                if is_fa_version_supported(4):
+                    importlib.import_module("vllm.vllm_flash_attn.cute.interface")
+                    self._fa4_prefill = flash_attn_varlen_func
+                    register_cutedsl_warmup_provider(self)
+            except (ImportError, OSError):
+                pass
+
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.is_kvcache_nvfp4 and vllm_config is not None:
             max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -1549,6 +1626,68 @@ class FlashInferImpl(AttentionImpl):
             self.dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
         else:
             self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
+
+    def _run_fa4_prefill(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        max_q_len: int,
+        cu_seqlens_q: torch.Tensor,
+        max_seq_len: int,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        assert self._fa4_prefill is not None
+        k_cache, v_cache = kv_cache.unbind(dim=1)
+        self._fa4_prefill(
+            query,
+            k_cache.transpose(1, 2),
+            v_cache.transpose(1, 2),
+            max_seqlen_q=max_q_len,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seq_len,
+            seqused_k=seq_lens,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=self.sliding_window,
+            block_table=block_table,
+            out=out,
+            # One KV split: the split-KV kernels would compile at first use.
+            num_splits=1,
+            fa_version=4,
+        )
+
+    def get_cutedsl_warmup_compile_units(self) -> tuple[CuTeDSLCompileUnit, ...]:
+        """Compile the FA4 prefill kernels before serving."""
+        if self._fa4_prefill is None:
+            return ()
+        # FA4 builds one kernel per window and per q_stage (one or two 128-row
+        # Q tiles after GQA packing); a 1-token and a 129-token query cover both.
+        return tuple(
+            CuTeDSLCompileUnit(
+                name="fa4_flashinfer_prefill",
+                key=("fa4_flashinfer_prefill", self.sliding_window, q_len, kv_len),
+                compile=partial(self._warm_up_fa4_prefill, q_len, kv_len),
+            )
+            for q_len, kv_len in ((1, 1), (129, 129))
+        )
+
+    def _warm_up_fa4_prefill(self, q_len: int, kv_len: int) -> None:
+        # One request whose pages (16 tokens, as the route requires) all point
+        # at one zero page.
+        kv_shape = (1, 2, self.num_kv_heads, 16, self.head_size)
+        kv_cache = torch.zeros(kv_shape, dtype=torch.bfloat16, device="cuda")
+        q_shape = (q_len, self.num_heads, self.head_size)
+        query = torch.zeros(q_shape, dtype=torch.bfloat16, device="cuda")
+        lens = torch.tensor([0, q_len, kv_len], dtype=torch.int32, device="cuda")
+        block_table = torch.zeros(
+            (1, cdiv(kv_len, 16)), dtype=torch.int32, device="cuda"
+        )
+        out = torch.empty_like(query)
+        self._run_fa4_prefill(
+            query, kv_cache, q_len, lens[:2], kv_len, lens[2:], block_table, out
+        )
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         # XQA does not support FP8/NVFP4 output, so require trtllm-gen
@@ -1833,6 +1972,26 @@ class FlashInferImpl(AttentionImpl):
                         output[
                             num_decode_tokens : num_decode_tokens + num_prefill_tokens
                         ].copy_(out_prefill.to(output.dtype))
+            elif (
+                self._fa4_prefill is not None
+                and prefill_query.dtype == kv_cache_permute.dtype == torch.bfloat16
+                and output.dtype == torch.bfloat16
+                and output_scale is None
+                and kv_cache_permute.shape[-2] == 16
+                and get_kv_cache_layout() == "HND"
+            ):
+                prefill = attn_metadata.prefill
+                assert isinstance(prefill, TRTLLMPrefill)
+                self._run_fa4_prefill(
+                    prefill_query,
+                    kv_cache_permute,
+                    prefill.max_q_len,
+                    prefill.cum_seq_lens_q,
+                    prefill.max_seq_len,
+                    prefill.seq_lens,
+                    prefill.block_tables,
+                    output[num_decode_tokens:],
+                )
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
                 # prefill_query may be non-contiguous or have degenerate strides
@@ -2102,6 +2261,44 @@ class FlashInferImpl(AttentionImpl):
                 if needs_fp8_out:
                     output[:num_decode_tokens].copy_(out.to(output.dtype))
         return output_padded
+
+    def fused_qk_norm_rope_kvcache_supported(self) -> bool:
+        # The fused kernel writes the same cache entries as
+        # reshape_and_cache_flash below, for unquantized caches.
+        return (
+            self.kv_sharing_target_layer_name is None
+            and not is_quantized_kv_cache(self.kv_cache_dtype)
+            and custom_ops.has_fused_qk_norm_rope_kv_insert()
+        )
+
+    def do_qk_norm_rope_kvcache_update(
+        self,
+        layer: torch.nn.Module,
+        qkv: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        positions: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        rms_norm_eps: float,
+        cos_sin_cache: torch.Tensor | None,
+        kv_cache: torch.Tensor | None,
+        layer_slot_mapping: torch.Tensor | None,
+    ) -> None:
+        custom_ops.fused_qk_norm_rope_kv_insert(
+            qkv,
+            q_out,
+            k_out,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            rms_norm_eps,
+            layer_slot_mapping,
+            kv_cache if layer_slot_mapping is not None else None,
+        )
 
     def do_kv_cache_update(
         self,

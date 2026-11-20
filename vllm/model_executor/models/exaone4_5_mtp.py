@@ -7,13 +7,23 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsLinearMethod,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -107,6 +117,8 @@ class Exaone4_5MultiTokenPredictor(ExaoneMoeMultiTokenPredictor):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
+        *,
+        output_token_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if get_pp_group().is_first_rank:
             if inputs_embeds is None:
@@ -127,6 +139,7 @@ class Exaone4_5MultiTokenPredictor(ExaoneMoeMultiTokenPredictor):
             positions=positions,
             hidden_states=hidden_states,
             residual=residual,
+            output_token_indices=output_token_indices,
         )
 
         if not get_pp_group().is_last_rank:
@@ -136,6 +149,29 @@ class Exaone4_5MultiTokenPredictor(ExaoneMoeMultiTokenPredictor):
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
+
+
+@support_torch_compile
+class _SelectedRowsPredictor(nn.Module):
+    def __init__(self, *, model: Exaone4_5MultiTokenPredictor):
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        output_token_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model.forward(
+            input_ids,
+            positions,
+            hidden_states,
+            inputs_embeds=inputs_embeds,
+            output_token_indices=output_token_indices,
+        )
 
 
 @support_torch_compile
@@ -151,6 +187,47 @@ class Exaone4_5_MTP(ExaoneMoeMTP, SupportsMultiModal):
         self.model = Exaone4_5MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
+        parallel_config = vllm_config.parallel_config
+        compilation_config = vllm_config.compilation_config
+        scheduler_config = vllm_config.scheduler_config
+        self.supports_mtp_row_selection = (
+            parallel_config.tensor_parallel_size == 1
+            and parallel_config.pipeline_parallel_size == 1
+            and parallel_config.data_parallel_size == 1
+            and vllm_config.lora_config is None
+            # The token and selected-row axes must stay independently dynamic.
+            and not compilation_config.compile_sizes
+            and not any(
+                r.is_single_size() for r in compilation_config.get_compile_ranges()
+            )
+            and 1
+            < scheduler_config.max_num_seqs
+            < scheduler_config.max_num_batched_tokens
+            # The projection and MLP must quantize activations independently
+            # of the other rows in the batch.
+            and all(
+                isinstance(linear.quant_method, UnquantizedLinearMethod)
+                or (
+                    isinstance(linear.quant_method, CompressedTensorsLinearMethod)
+                    and isinstance(linear.scheme, CompressedTensorsW8A8Fp8)
+                )
+                for layer in self.model.layers
+                for linear in (
+                    layer.self_attn.o_proj,
+                    layer.mlp.gate_up_proj,
+                    layer.mlp.down_proj,
+                )
+            )
+        )
+        if self.supports_mtp_row_selection:
+            # Keep one weight path for loading. The wrapper compiles a second
+            # signature over the same predictor and weights.
+            with set_model_tag("eagle_head_selected_rows"):
+                object.__setattr__(
+                    self,
+                    "forward_with_selected_rows",
+                    _SelectedRowsPredictor(vllm_config=vllm_config, model=self.model),
+                )
         self.unpadded_vocab_size = config.vocab_size
         self.lm_head = ParallelLMHead(
             self.unpadded_vocab_size,

@@ -117,11 +117,21 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
     Enable if either SiLU+Mul or quant FP8 custom op is active;
     otherwise Inductor handles fusion.
     Also enable for FP4 models as FP4 quant is always custom so Inductor cannot fuse it.
+    Also enable on CUDA for dynamic per-token FP8 activations: the fused
+    per-token kernel is faster than the Inductor kernels for SiLU+Mul + quant.
     """
+    from vllm.platforms import current_platform
+
+    quant_config = cfg.quant_config
     return (
         cfg.compilation_config.is_custom_op_enabled("silu_and_mul")
         or cfg.compilation_config.is_custom_op_enabled("quant_fp8")
         or (cfg.model_config is not None and cfg.model_config.is_nvfp4_quantized())
+        or (
+            current_platform.is_cuda()
+            and hasattr(quant_config, "has_dynamic_per_token_fp8_activations")
+            and quant_config.has_dynamic_per_token_fp8_activations()
+        )
     )
 
 

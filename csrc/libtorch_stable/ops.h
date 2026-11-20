@@ -315,6 +315,19 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     std::optional<torch::stable::Tensor> index_q_out,
     const std::string& kv_cache_dtype);
 
+// Fused per-head QK RMSNorm + optional NeoX RoPE (full head) + KV-cache
+// write. Writes the normed/roped q and k to q_out / k_out and, when kv_cache
+// is given, k and v into the paged cache by slot_mapping.
+void fused_qk_norm_rope_kv_insert(
+    torch::stable::Tensor const& qkv, torch::stable::Tensor& q_out,
+    torch::stable::Tensor& k_out, torch::stable::Tensor const& q_weight,
+    torch::stable::Tensor const& k_weight,
+    std::optional<torch::stable::Tensor> cos_sin_cache,
+    torch::stable::Tensor const& positions, int64_t num_heads,
+    int64_t num_kv_heads, double eps,
+    std::optional<torch::stable::Tensor> slot_mapping,
+    std::optional<torch::stable::Tensor> kv_cache);
+
 // Sampler kernels (shared CUDA/ROCm)
 void apply_repetition_penalties_(
     torch::stable::Tensor& logits, const torch::stable::Tensor& prompt_mask,
@@ -344,6 +357,12 @@ void cooperative_topk(const torch::stable::Tensor& logits,
                       torch::stable::Tensor& output,
                       torch::stable::Tensor& workspace, int64_t k,
                       int64_t max_seq_len);
+#endif
+
+#ifdef VLLM_ENABLE_SILU_FP8_SM100
+void silu_mul_per_token_quant_sm100(const torch::stable::Tensor& input,
+                                    torch::stable::Tensor& out,
+                                    torch::stable::Tensor& scales, bool staged);
 #endif
 
 void selective_scan_fwd(

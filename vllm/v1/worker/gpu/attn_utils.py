@@ -583,6 +583,9 @@ def build_attn_metadata(
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
+    # Groups of one KV cache spec share the batch: their builders can derive
+    # the metadata from the first one (update_block_table) instead of building.
+    cached_metadata: dict[tuple[AttentionSpec, type], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
@@ -614,7 +617,20 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
-            if for_cudagraph_capture:
+            spec = attn_metadata_builder.kv_cache_spec
+            reuse_key = None
+            if (
+                causal
+                and model_specific_attn_metadata is None
+                and attn_metadata_builder.supports_update_block_table
+                and isinstance(spec, AttentionSpec)
+            ):
+                reuse_key = (spec, type(attn_metadata_builder))
+            if reuse_key in cached_metadata:
+                metadata = attn_metadata_builder.update_block_table(
+                    cached_metadata[reuse_key], block_table, slot_mapping
+                )
+            elif for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
@@ -632,6 +648,8 @@ def build_attn_metadata(
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+            if reuse_key is not None:
+                cached_metadata.setdefault(reuse_key, metadata)
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata

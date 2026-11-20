@@ -468,6 +468,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "int block_size, Tensor!? q_out, Tensor!? index_q_out, "
       "str kv_cache_dtype) -> ()");
 
+  // Fused per-head QK RMSNorm + optional RoPE + KV-cache write.
+  ops.def(
+      "fused_qk_norm_rope_kv_insert("
+      "Tensor qkv, Tensor! q_out, Tensor! k_out, Tensor q_weight, "
+      "Tensor k_weight, Tensor? cos_sin_cache, Tensor positions, "
+      "int num_heads, int num_kv_heads, float eps, Tensor? slot_mapping, "
+      "Tensor!? kv_cache) -> ()");
+
   // Apply repetition penalties to logits in-place.
   ops.def(
       "apply_repetition_penalties_(Tensor! logits, Tensor prompt_mask, "
@@ -515,6 +523,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // SwiGLU activation with FP8 quantization.
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
+
+#ifdef VLLM_ENABLE_SILU_FP8_SM100
+  ops.def(
+      "silu_mul_per_token_quant_sm100("
+      "Tensor input, Tensor! out, Tensor! scales, bool staged) -> ()");
+#endif
 
   // Activation function used in GeGLU with `none` approximation.
   ops.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
@@ -677,6 +691,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 #endif
   ops.impl("fused_minimax_m3_qknorm_rope_kv_insert",
            TORCH_BOX(&fused_minimax_m3_qknorm_rope_kv_insert));
+  ops.impl("fused_qk_norm_rope_kv_insert",
+           TORCH_BOX(&fused_qk_norm_rope_kv_insert));
 
   // Sampler kernels (shared CUDA/ROCm)
   ops.impl("apply_repetition_penalties_",
@@ -693,6 +709,10 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
            TORCH_BOX(&persistent_masked_m_silu_mul_quant));
   ops.impl("weak_ref_tensor", TORCH_BOX(&weak_ref_tensor));
   ops.impl("silu_and_mul_quant", TORCH_BOX(&silu_and_mul_quant));
+#ifdef VLLM_ENABLE_SILU_FP8_SM100
+  ops.impl("silu_mul_per_token_quant_sm100",
+           TORCH_BOX(&silu_mul_per_token_quant_sm100));
+#endif
   ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));
   ops.impl("mul_and_silu", TORCH_BOX(&mul_and_silu));
   ops.impl("gelu_and_mul", TORCH_BOX(&gelu_and_mul));

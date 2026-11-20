@@ -214,6 +214,27 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         self._prepare_eplb_forward(input_batch.num_tokens)
+        supports_row_selection = getattr(
+            self.model, "supports_mtp_row_selection", False
+        )
+
+        if (
+            supports_row_selection
+            and is_profile
+            and dummy_run
+            and skip_attn_for_dummy_run
+            and 1 < num_reqs < num_tokens
+        ):
+            # Compile the compact signature before serving, with the two
+            # leading dimensions distinct and no attention cache writes.
+            self._run_model(
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                mm_inputs=mm_inputs,
+                output_token_indices=self.last_token_indices[:num_reqs],
+            )
 
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
@@ -231,6 +252,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
+                select_output_rows=(
+                    prefill_batch_desc.cg_mode == CUDAGraphMode.NONE
+                    and not dummy_run
+                    and not is_profile
+                    and max_query_len > self.num_speculative_steps + 1
+                    and supports_row_selection
+                ),
             )
 
         if self.num_speculative_steps == 1:
@@ -279,6 +307,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        output_token_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -310,7 +339,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )
-            if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            if output_token_indices is not None:
+                ret_hidden_states = self.model.forward_with_selected_rows(
+                    **model_inputs, output_token_indices=output_token_indices
+                )
+            elif cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
                 # Draft prefill with PIECEWISE cudagraph (compiled PW or breakable),
                 # chosen inside run_pw_graph.
                 assert self.prefill_cudagraph_manager is not None
@@ -338,6 +371,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        select_output_rows: bool = False,
     ) -> None:
         last_token_indices = self.last_token_indices[:num_reqs]
         positions = self.input_buffers.positions[last_token_indices]
@@ -350,8 +384,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            output_token_indices=last_token_indices if select_output_rows else None,
         )
-        sample_hidden_states = last_hidden_states[last_token_indices]
+        sample_hidden_states = (
+            last_hidden_states
+            if select_output_rows
+            else last_hidden_states[last_token_indices]
+        )
 
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(
             sample_hidden_states,
@@ -365,7 +404,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if last_hidden_states is hidden_states:
             self.hidden_states[:num_reqs] = sample_hidden_states
         else:
-            self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
+            self.hidden_states[:num_reqs] = (
+                hidden_states
+                if select_output_rows
+                else hidden_states[last_token_indices]
+            )
         self.input_buffers.positions[:num_reqs] = positions
 
     def _multi_step_decode(

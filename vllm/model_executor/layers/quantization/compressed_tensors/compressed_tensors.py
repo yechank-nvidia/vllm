@@ -906,6 +906,28 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return True
         return False
 
+    def has_dynamic_per_token_fp8_activations(self) -> bool:
+        """True if some layer runs CompressedTensorsW8A8Fp8 with dynamic input
+        activations and non-block weights. That scheme quantizes them to FP8
+        per token (kFp8DynamicTokenSym) whatever strategy the config stores."""
+        for scheme in self.target_scheme_map.values():
+            weight_quant = scheme.get("weights")
+            input_quant = scheme.get("input_activations")
+            format = scheme.get("format")
+            if (
+                is_activation_quantization_format(
+                    format if format is not None else self.quant_format
+                )
+                and self._is_fp8_w8a8(weight_quant, input_quant)
+                and input_quant.dynamic
+                and weight_quant.strategy != QuantizationStrategy.BLOCK
+                and self._check_scheme_supported(
+                    CompressedTensorsW8A8Fp8.get_min_capability(), error=False
+                )
+            ):
+                return True
+        return False
+
 
 class CompressedTensorsLinearMethod(LinearMethodBase):
     def __init__(self, quantization_config: CompressedTensorsConfig):

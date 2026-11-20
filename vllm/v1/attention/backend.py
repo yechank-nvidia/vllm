@@ -937,6 +937,33 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         """
         raise NotImplementedError
 
+    def fused_qk_norm_rope_kvcache_supported(self) -> bool:
+        """Does this attention implementation support the fused per-head
+        QK-norm + RoPE + KV-cache update (`do_qk_norm_rope_kvcache_update`)."""
+        return False
+
+    def do_qk_norm_rope_kvcache_update(
+        self,
+        layer: AttentionLayer,
+        qkv: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        positions: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        rms_norm_eps: float,
+        cos_sin_cache: torch.Tensor | None,
+        kv_cache: torch.Tensor | None,
+        layer_slot_mapping: torch.Tensor | None,
+    ) -> None:
+        """If `fused_qk_norm_rope_kvcache_supported` returns True, this method
+        is called by torch.ops.vllm.fused_qk_norm_rope_and_unified_kv_cache_update.
+        Applies per-head QK RMSNorm and NeoX RoPE over the full head (none when
+        `cos_sin_cache` is None), writes q and k to `q_out` / `k_out` and, when
+        `layer_slot_mapping` is given, k and v to `kv_cache`.
+        """
+        raise NotImplementedError
+
 
 class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     """MLA attention implementation with forward_mqa and forward_mha methods."""

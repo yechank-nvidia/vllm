@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1849,6 +1850,101 @@ def test_get_kv_cache_config_one_worker():
         ],
         kv_cache_groups=[KVCacheGroupSpec(["layer_1", "layer_2"], new_kv_cache_spec())],
     )
+
+
+def _full_and_sw_specs(num_full: int, num_sw: int) -> dict[str, KVCacheSpec]:
+    specs: dict[str, KVCacheSpec] = {
+        f"full.{i}": new_kv_cache_spec() for i in range(num_full)
+    }
+    specs.update({f"sw.{i}": new_sliding_window_spec() for i in range(num_sw)})
+    return specs
+
+
+@pytest.mark.parametrize(
+    "num_full,num_sw,group_size",
+    [
+        (16, 49, 4),  # EXAONE 4.5 + MTP: 48 sw + 16 full, the MTP layer is sw
+        (16, 48, 16),  # EXAONE 4.5 without MTP
+        (20, 30, 10),  # not an n:1 pattern
+        (10, 52, 5),  # Gemma 3 27B
+        (8, 40, 8),  # Gemma 3 12B
+        (5, 29, 5),  # Gemma 3 4B
+        (4, 22, 4),  # Gemma 3 1B
+        (13, 12, 13),  # gpt-oss-20b + EAGLE3 (full-attention draft layer)
+        (19, 18, 19),  # gpt-oss-120b + EAGLE3
+        (3, 7, 3),  # group size already below 4
+        (20, 61, 5),  # size 4 saves 1 more slot but adds 4 groups: keep 5
+        (16, 20, 4),  # the 1.5x rule picks 20 (4 padding layers), 4 needs none
+        (16, 44, 16),  # size 4 saves 4 slots but adds 11 groups
+    ],
+)
+def test_kv_cache_groups_reduce_padding(num_full, num_sw, group_size):
+    specs = _full_and_sw_specs(num_full, num_sw)
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(
+        specs, reduce_padding=True
+    )
+    assert max(len(group.layer_names) for group in groups) == group_size
+    assert sorted(name for g in groups for name in g.layer_names) == sorted(specs)
+    for group in groups:
+        assert {specs[name] for name in group.layer_names} == {group.kv_cache_spec}
+
+
+@pytest.mark.parametrize("num_full", range(1, 25))
+def test_kv_cache_groups_never_need_more_slots(num_full):
+    # Smaller groups must not cost any request KV capacity at any length: every
+    # type gets at most as many layer slots as without the padding reduction.
+    def slots(groups, spec_type):
+        size = max(len(group.layer_names) for group in groups)
+        return size * sum(isinstance(g.kv_cache_spec, spec_type) for g in groups)
+
+    for num_sw in range(1, 73):
+        specs = _full_and_sw_specs(num_full, num_sw)
+        old = kv_cache_utils._get_kv_cache_groups_uniform_page_size(specs)
+        new = kv_cache_utils._get_kv_cache_groups_uniform_page_size(
+            specs, reduce_padding=True
+        )
+        old_size = max(len(group.layer_names) for group in old)
+        size = max(len(group.layer_names) for group in new)
+        assert old_size % size == 0
+        # Each added group must save at least half a padding slot.
+        saved_slots = old_size * len(old) - size * len(new)
+        assert len(new) - len(old) <= 2 * saved_slots
+        for spec_type in (FullAttentionSpec, SlidingWindowSpec):
+            assert slots(new, spec_type) <= slots(old, spec_type)
+
+
+def test_kv_cache_groups_keep_mamba_hybrid_group_size():
+    specs: dict[str, KVCacheSpec] = {
+        f"full.{i}": new_kv_cache_spec() for i in range(16)
+    }
+    specs.update({f"mamba.{i}": new_mamba_spec() for i in range(49)})
+    assert len({spec.page_size_bytes for spec in specs.values()}) == 1
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(
+        specs, reduce_padding=True
+    )
+    assert max(len(group.layer_names) for group in groups) == 16
+
+
+def test_kv_cache_groups_reduce_chunked_local_padding():
+    specs: dict[str, KVCacheSpec] = {
+        f"full.{i}": new_kv_cache_spec() for i in range(12)
+    }
+    specs.update({f"local.{i}": new_chunked_local_attention_spec() for i in range(37)})
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(
+        specs, reduce_padding=True
+    )
+    assert max(len(group.layer_names) for group in groups) == 4
+
+
+@pytest.mark.parametrize("pp_size,group_size", [(1, 4), (2, 16)])
+def test_kv_cache_group_size_with_pipeline_parallelism(pp_size, group_size):
+    # With PP every group takes a block on every stage, so keep the grouping.
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
+    )
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, _full_and_sw_specs(16, 49))
+    assert max(len(group.layer_names) for group in groups) == group_size
 
 
 def test_get_kv_cache_configs_attention_free():

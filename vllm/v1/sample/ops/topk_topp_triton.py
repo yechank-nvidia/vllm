@@ -90,7 +90,8 @@ def _update_min_larger_stats(data, above_mask, min_larger, num_min_larger, senti
     return min_larger, num_min_larger
 
 
-@triton.jit
+# BATCH_SIZE is only the row-loop bound: one compiled variant for every size.
+@triton.jit(do_not_specialize=["BATCH_SIZE"])
 def _topk_topp_kernel(
     LOGITS,
     LOGITS_STRIDE_0,
@@ -181,6 +182,8 @@ def _topk_topp_kernel(
                     num_outliers += tl.sum(outlier_mask)
                     write_pos = tl.where(outlier_mask, cumulative_pos, -1)
                     tl.store(BUFFER_ROW + write_pos, logits_blk, mask=outlier_mask)
+                # Other threads read these scattered BUFFER entries next.
+                tl.debug_barrier()
 
                 # If no finite logits exist (all -inf), clamp min to
                 # max so the search converges to -inf (no masking).
@@ -491,6 +494,8 @@ def _topk_topp_kernel(
                                 tl.store(
                                     BUFFER_ROW + write_pos, probs_blk, mask=outlier_mask
                                 )
+                            # Other threads read these scattered BUFFER entries next.
+                            tl.debug_barrier()
 
                             search_range = tl.cast(num_outliers_2, tl.int32)
                             search_iters = tl.cast(
@@ -672,6 +677,8 @@ def _topk_topp_kernel(
                     num_outliers += tl.sum(outlier_mask)
                     write_pos = tl.where(outlier_mask, cumulative_pos, -1)
                     tl.store(BUFFER_ROW + write_pos, probs_blk, mask=outlier_mask)
+                # Other threads read or refill these scattered BUFFER entries next.
+                tl.debug_barrier()
 
                 max_range = tl.exp(max_logit - max_sample) / sum_exp_logits
                 min_range = tl.exp(min_logit - max_sample) / sum_exp_logits
@@ -932,11 +939,14 @@ def apply_top_k_top_p_triton(
     # On XPU, large BLOCK_SIZE causes precision loss in the single-pass pivot
     # approximation; use smaller tiles for accurate top-p results.
     if logits.device.type == "cpu":
-        block_size, block_size_trunc = 256, 128
+        block_size, block_size_trunc, num_warps = 256, 128, 4
     elif logits.device.type == "xpu":
-        block_size, block_size_trunc = 4096, 2048
+        block_size, block_size_trunc, num_warps = 4096, 2048, 4
     else:
-        block_size, block_size_trunc = 8192, 4096
+        block_size, block_size_trunc, num_warps = 8192, 4096, 8
+        # Each program serially sweeps the vocab row in BLOCK_SIZE tiles, so
+        # per-tile latency bounds kernel latency; 8 warps beat Triton's
+        # default of 4 here.
 
     _topk_topp_kernel[(NUM_PROGRAMS,)](
         logits,
@@ -953,6 +963,7 @@ def apply_top_k_top_p_triton(
         BLOCK_SIZE_TRUNC=block_size_trunc,
         TOPK_ENABLED=topk_enabled,
         TOPP_ENABLED=topp_enabled,
+        num_warps=num_warps,
     )
 
     return logits

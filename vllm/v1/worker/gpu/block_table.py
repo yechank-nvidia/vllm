@@ -61,7 +61,7 @@ class BlockTables:
         if self.num_kv_cache_groups > 1:
             # Only the multi-group path uses the fused writer.
             self.fused_writer = FusedStagedWriter(
-                self.device, self.num_kv_cache_groups * self.max_num_reqs
+                self.num_kv_cache_groups * self.max_num_reqs
             )
 
         # Block tables used for model's forward pass.
@@ -110,13 +110,17 @@ class BlockTables:
         new_block_ids: tuple[list[int], ...],
         overwrite: bool,
     ) -> None:
+        writer = self.fused_writer
         for i in range(self.num_kv_cache_groups):
-            start = self.num_blocks.np[i, req_index] if not overwrite else 0
+            start = 0 if overwrite else int(self.num_blocks.np[i, req_index])
             block_ids = new_block_ids[i]
             bpk = self.blocks_per_kv_block[i]
             if bpk > 1:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
-            self.block_tables[i].stage_write(req_index, start, block_ids)
+            if writer is None:
+                self.block_tables[i].stage_write(req_index, start, block_ids)
+            else:
+                writer.stage_write(i, req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = start + len(block_ids)
 
     def apply_staged_writes(self) -> None:
@@ -126,9 +130,7 @@ class BlockTables:
         else:
             # Multiple groups: apply all block tables with one fused kernel.
             assert self.fused_writer is not None
-            self.fused_writer.apply(
-                self.block_tables, self.block_table_ptrs, self.block_table_strides
-            )
+            self.fused_writer.apply(self.block_table_ptrs, self.block_table_strides)
         self.num_blocks.copy_to_uva()
 
     def gather_block_tables(

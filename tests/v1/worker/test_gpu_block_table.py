@@ -106,6 +106,20 @@ def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):
     assert block_tables.num_blocks.np[1, 0] == 6
     assert block_tables.num_blocks.np[2, 0] == 1
 
+    # Reuse the first payload buffer with more entries and different rows.
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=(list(range(10, 18)), list(range(20, 28)), []),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+    torch.accelerator.synchronize()
+
+    assert block_tables.block_tables[0].gpu[0].tolist() == list(range(10, 18))
+    assert block_tables.block_tables[1].gpu[0].tolist() == list(range(40, 56))
+    assert block_tables.block_tables[2].gpu[0, 0].item() == 8
+    assert block_tables.num_blocks.gpu[:, 0].tolist() == [8, 16, 0]
+
 
 def test_block_tables_apply_staged_writes_single_group():
     device = torch.device("cuda")

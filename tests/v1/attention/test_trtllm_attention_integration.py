@@ -537,3 +537,101 @@ def test_trtllm_gen_nvfp4_kv_integration(batch_spec_name: str):
         kv_cache_dtype="nvfp4",
         model_name=MODEL_NVFP4,
     )
+
+
+def _metadata_of_two_groups(batch_spec, use_trtllm_attention, builder_cls):
+    """Group A's metadata, group B's from build(), and group B's builder."""
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    vllm_config = create_vllm_config(
+        model_name=MODEL,
+        max_model_len=max(batch_spec.seq_lens),
+        block_size=BLOCK_SIZE,
+        num_gpu_blocks=NUM_GPU_BLOCKS,
+    )
+    vllm_config.attention_config.use_trtllm_attention = use_trtllm_attention
+    model_config = vllm_config.model_config
+    kv_cache_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+        head_size=model_config.get_head_size(),
+        dtype=model_config.dtype,
+    )
+    cm_a = create_common_attn_metadata(batch_spec, BLOCK_SIZE, device)
+    # Group B: same batch, its own block table and slot mapping.
+    cm_b = cm_a.replace(
+        block_table_tensor=torch.randint_like(cm_a.block_table_tensor, 1000),
+        slot_mapping=torch.randint_like(cm_a.slot_mapping, 1000),
+    )
+    set_kv_cache_layout("HND")
+    get_kv_cache_layout.cache_clear()
+    try:
+        with (
+            set_current_vllm_config(vllm_config),
+            unittest.mock.patch(
+                "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters",
+                _mock_get_per_layer_parameters,
+            ),
+        ):
+            builder_a = builder_cls(kv_cache_spec, ["a"], vllm_config, device)
+            builder_b = builder_cls(kv_cache_spec, ["b"], vllm_config, device)
+            meta_a = builder_a.build(common_prefix_len=0, common_attn_metadata=cm_a)
+            built = builder_b.build(common_prefix_len=0, common_attn_metadata=cm_b)
+    finally:
+        set_kv_cache_layout(None)
+        get_kv_cache_layout.cache_clear()
+    return cm_b, meta_a, built, builder_b
+
+
+def _assert_fields_equal(got, want, skip=()):
+    for name, value in vars(want).items():
+        if name not in skip:
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(getattr(got, name), value), name
+            else:
+                assert getattr(got, name) == value, name
+
+
+@pytest.mark.parametrize("batch_spec_name", list(BATCH_SPECS.keys()))
+def test_update_block_table_equals_build_with_trtllm(batch_spec_name: str):
+    """For another KV cache group of the same spec, update_block_table()
+    returns what build() returns: only the block table rows and slot mapping
+    differ."""
+    cm_b, meta_a, built, builder_b = _metadata_of_two_groups(
+        BATCH_SPECS[batch_spec_name], None, FlashInferMetadataBuilder
+    )
+    assert builder_b.supports_update_block_table
+    updated = builder_b.update_block_table(
+        meta_a, cm_b.block_table_tensor, cm_b.slot_mapping
+    )
+    _assert_fields_equal(updated, built, skip=("prefill", "decode", "slot_mapping"))
+    assert updated.slot_mapping is cm_b.slot_mapping
+    for part in ("prefill", "decode"):
+        got, want = getattr(updated, part), getattr(built, part)
+        assert type(got) is type(want)
+        if want is None:
+            continue
+        assert isinstance(want, (TRTLLMPrefill, FlashInferTrtllmAPIDecode))
+        _assert_fields_equal(got, want, skip=("block_tables",))
+        # The same rows of group B's block table.
+        assert got.block_tables.data_ptr() == want.block_tables.data_ptr()
+        assert got.block_tables.shape == want.block_tables.shape
+        # Group A keeps its own block table.
+        assert getattr(meta_a, part).block_tables.data_ptr() != (
+            want.block_tables.data_ptr()
+        )
+
+
+def test_no_update_block_table_for_flashinfer_native():
+    """FlashInfer-native wrappers hold page indices from the block table."""
+    *_, builder_b = _metadata_of_two_groups(
+        BATCH_SPECS["mixed"], False, FlashInferMetadataBuilder
+    )
+    assert not builder_b.supports_update_block_table
+
+
+def test_no_update_block_table_for_subclasses():
+    class SubclassBuilder(FlashInferMetadataBuilder):
+        pass
+
+    *_, builder_b = _metadata_of_two_groups(BATCH_SPECS["mixed"], None, SubclassBuilder)
+    assert not builder_b.supports_update_block_table

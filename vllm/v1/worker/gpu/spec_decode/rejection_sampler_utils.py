@@ -717,6 +717,22 @@ def _resample_kernel(
         other=float("-inf"),
     ).to(tl.float32)
 
+    if tl.max(target_logits, axis=0) == float("-inf"):
+        # Empty target blocks (masked by top-k / top-p) have no residual mass.
+        # Match the unskipped leftmost argmax on ties and leave surviving
+        # Philox counters untouched.
+        tl.store(
+            resampled_local_argmax_ptr
+            + req_idx * resampled_local_argmax_stride
+            + block_idx,
+            block_idx * BLOCK_SIZE,
+        )
+        tl.store(
+            resampled_local_max_ptr + req_idx * resampled_local_max_stride + block_idx,
+            float("-inf"),
+        )
+        return
+
     # Compute the residual logits to resample the rejected token from.
     if is_bonus:
         # Bonus token (no rejections). Directly use the target logits.
@@ -1121,5 +1137,8 @@ def rejection_sample(
         expanded_idx_mapping,
         temperature,
         PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
+        # The kernel reads and updates num_sampled in place. Multiple warps can
+        # observe the increment before loading the original resampling index.
+        num_warps=1,
     )
     return sampled, num_sampled

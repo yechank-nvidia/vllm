@@ -12,6 +12,7 @@ from vllm.compilation.passes.utility.post_cleanup import PostCleanupPass
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON
 from vllm.utils.system_utils import set_env_var
 
 from .ir.clone_elimination import UnsafeCloneEliminationPass
@@ -38,7 +39,10 @@ if current_platform.is_cuda_alike():
     from .fusion.mla_attn_quant_fusion import MLAAttnQuantFusionPass
     from .fusion.mla_rope_kvcache_cat_fusion import MLARoPEKVCacheCatFusionPass
     from .fusion.qk_norm_rope_fusion import QKNormRoPEFusionPass
-    from .fusion.rms_quant_fusion import RMSNormQuantFusionPass
+    from .fusion.rms_quant_fusion import (
+        PostNormFusionPass,
+        RMSNormQuantFusionPass,
+    )
     from .fusion.rope_kvcache_fusion import RopeKVCacheFusionPass
     from .utility.scatter_split_replace import ScatterSplitReplacementPass
     from .utility.split_coalescing import SplitCoalescingPass
@@ -165,6 +169,11 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                         RocmAiterRMSNormQuantFusionPass(config),
                     ]
                 self.passes += [RMSNormQuantFusionPass(config)]
+
+            # Post-norm blocks (residual + rms_norm(x)) have no fused kernel
+            # otherwise. The pass only rewrites graphs that contain them.
+            if current_platform.is_cuda() and HAS_TRITON:
+                self.passes += [PostNormFusionPass(config)]
 
             if self.pass_config.fuse_act_quant:
                 self.passes += [ActivationQuantFusionPass(config)]

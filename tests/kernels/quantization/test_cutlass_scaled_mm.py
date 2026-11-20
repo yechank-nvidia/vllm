@@ -38,6 +38,20 @@ MNK_FACTORS = [
     (512, 8192, 4096),
     (512, 16384, 128),
     (512, 24576, 128),
+    # Small M, small N, long K: on SM100 these pick the shape-aware configs
+    # (one-wave default, one-wave swap AB, 256x256 tiles, stream-K) instead of
+    # the M-only one.
+    (160, 5120, 4096),
+    (320, 5120, 4096),
+    (448, 5120, 8192),
+    (1000, 5120, 8192),
+    # Large M: 256x256 tiles.
+    (4096, 5120, 4096),
+    # The same branches with partial N and K tiles.
+    (160, 5104, 4112),
+    (320, 5104, 4112),
+    (448, 5104, 8208),
+    (1000, 5104, 8208),
 ]
 
 # Shapes with N or K not divisible by 16.  These exercise the padding path
@@ -418,6 +432,54 @@ def test_cutlass_fp8_gemm_m_sweep(
             cutlass_fp8_gemm_helper(
                 m, nk, nk, a_scale_group_shape, b_scale_group_shape, use_bias
             )
+
+
+@pytest.mark.skipif(
+    not (100 <= capability < 120),
+    reason="Tests the SM100 FP8 tile choice.",
+)
+def test_cutlass_fp8_gemm_stream_k_without_workspace_memory():
+    """Stream-K needs a reduction workspace that the data-parallel configs do
+    not. When it cannot be allocated, the GEMM must still run, with the
+    data-parallel config."""
+    m, n, k = 1000, 5120, 8192  # stream-K on 148- and 152-SM GPUs
+    a = to_fp8(torch.randn((2048, k), device="cuda"))
+    b = to_fp8(torch.randn((n, k), device="cuda").t())
+    scale_a = torch.randn((2048, 1), device="cuda", dtype=torch.float32)
+    scale_b = torch.randn((1, n), device="cuda", dtype=torch.float32)
+    # M = 2048 keeps the data-parallel M-only config, whose rows do not depend
+    # on M: the expected bits of the fallback.
+    expected = ops.cutlass_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16)[:m]
+    a, scale_a = a[:m], scale_a[:m]
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+
+    # Cap the caching allocator just above what it holds, then fill it.
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
+    total = torch.cuda.get_device_properties(a.device).total_memory
+    torch.cuda.set_per_process_memory_fraction(
+        min(1.0, (torch.accelerator.memory_reserved() + (64 << 20)) / total)
+    )
+    fillers = []
+    try:
+        for size_mib in (64, 16, 10, 4, 2, 1):
+            while True:
+                try:
+                    fillers.append(
+                        torch.empty(size_mib << 20, dtype=torch.uint8, device="cuda")
+                    )
+                except torch.OutOfMemoryError:
+                    break
+        torch.ops._C.cutlass_scaled_mm(out, a, b, scale_a, scale_b, None)
+        torch.accelerator.synchronize()
+    finally:
+        fillers.clear()
+        torch.cuda.set_per_process_memory_fraction(1.0)
+        torch.accelerator.empty_cache()
+
+    baseline = baseline_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, None)
+    torch.testing.assert_close(out, baseline, rtol=5e-1, atol=1.5e-1)
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize(

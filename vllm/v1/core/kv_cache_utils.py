@@ -1105,8 +1105,41 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
     return not kv_cache_spec
 
 
+def _reduce_kv_cache_padding(num_layers: list[int], group_size: int) -> int:
+    """Return a divisor of `group_size` with fewer padding layers, if it pays.
+
+    Each KV cache group has `group_size` layer slots, so a type with a layer count
+    that is not a multiple of `group_size` gets padding slots, which take KV cache
+    memory. E.g., EXAONE 4.5 + MTP has 16 full + 49 sw layers: group size 16 pads
+    the sw layers to 64 slots, group size 4 to 52.
+
+    A divisor of `group_size` never needs more slots than `group_size` for any
+    type (the next multiple of `group_size` is also a multiple of the divisor).
+    When one worker holds all layers, the slots of a type set its KV bytes per
+    token, so no request loses KV capacity at any length. Each extra group adds
+    per-step block table work and buffers, so a smaller size must save at least
+    one padding slot per two groups it adds.
+    """
+
+    def num_groups(size: int) -> int:
+        return sum(cdiv(n, size) for n in num_layers)
+
+    def num_padding(size: int) -> int:
+        return sum(round_up(n, size) - n for n in num_layers)
+
+    best = group_size
+    for size in range(group_size - 1, 0, -1):
+        if group_size % size:
+            continue
+        saved = num_padding(best) - num_padding(size)
+        if saved > 0 and 2 * saved >= num_groups(size) - num_groups(best):
+            best = size
+    return best
+
+
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    reduce_padding: bool = False,
 ) -> list[KVCacheGroupSpec]:
     """
     Generates the KV cache groups for hybrid models with multiple
@@ -1167,6 +1200,10 @@ def _get_kv_cache_groups_uniform_page_size(
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
+        reduce_padding: Try smaller group sizes that need fewer padding layers
+            (see `_reduce_kv_cache_padding`). Only for one worker holding all
+            layers: with pipeline parallelism every group takes a block on every
+            stage, so more groups can cost KV memory there.
     Returns:
         The generated KVCacheGroupSpecs
     """
@@ -1186,12 +1223,14 @@ def _get_kv_cache_groups_uniform_page_size(
     # open-source hybrid model follows a n:1 pattern between different attention
     # types (e.g., Gemma3 5:1 between sw and full, LLaMA4 3:1 between local and
     # full), so we can use the "1" in the n:1 pattern as the group size, which
-    # is the minimum number of layers among all attention types. Need a better
-    # strategy if we want to support more complex patterns (e.g., 20 full + 30
-    # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in same_type_layers.values()])
+    # is the minimum number of layers among all attention types. More complex
+    # patterns (e.g., 20 full + 30 sw, where the group size should be 10) are
+    # handled by `_reduce_kv_cache_padding` below when `reduce_padding` is set
+    # and every type keeps KV per token.
+    num_layers = [len(layers) for layers in same_type_layers.values()]
+    min_num_layers = min(num_layers)
     group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in same_type_layers.values()])
+    max_num_layers = max(num_layers)
     if max_num_layers < min_num_layers * 1.5:
         # If the number of layers is not much larger than the minimum number of
         # layers, use the maximum number of layers as the group size to avoid
@@ -1201,6 +1240,25 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    # Only when every type keeps KV per token, so padding costs memory per token;
+    # Mamba and other fixed-size states keep their grouping.
+    if reduce_padding and all(
+        isinstance(
+            spec, (FullAttentionSpec, SlidingWindowSpec, ChunkedLocalAttentionSpec)
+        )
+        for spec in same_type_layers
+    ):
+        reduced_size = _reduce_kv_cache_padding(num_layers, group_size)
+        if reduced_size != group_size:
+            logger.info(
+                "Use %d instead of %d layers per KV cache group to cut padding "
+                "layers from %d to %d",
+                reduced_size,
+                group_size,
+                sum(round_up(n, group_size) - n for n in num_layers),
+                sum(round_up(n, reduced_size) - n for n in num_layers),
+            )
+            group_size = reduced_size
     grouped_layers = []
     for layers in same_type_layers.values():
         num_padding_layers = group_size - len(layers) % group_size
@@ -1749,7 +1807,14 @@ def get_kv_cache_groups(
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
     filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    # Smaller groups only when one worker holds all layers: with pipeline
+    # parallelism every group takes a block on every stage. (Stand-in configs
+    # in tests may have no parallel_config; they get the default, no PP.)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    pp_size = parallel_config.pipeline_parallel_size if parallel_config else 1
+    groups = _get_kv_cache_groups_uniform_page_size(
+        filtered_spec, reduce_padding=pp_size == 1
+    )
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
